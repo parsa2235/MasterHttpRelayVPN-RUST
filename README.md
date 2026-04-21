@@ -261,6 +261,11 @@ This port focuses on the **`apps_script` mode** — the only one that reliably w
 - [x] Script IDs masked in logs (`prefix…suffix`) so `info` logs don't leak deployment IDs
 - [x] Desktop UI (egui) — cross-platform, no bundler needed
 - [x] Optional upstream SOCKS5 chaining for non-HTTP traffic (Telegram MTProto, IMAP, SSH…) so raw-TCP flows can be tunneled through xray / v2ray / sing-box instead of connecting directly. HTTP/HTTPS keeps going through the Apps Script relay.
+- [x] Connection pool pre-warm on startup (first request skips the TLS handshake to Google edge).
+- [x] Per-connection SNI rotation across a pool of Google subdomains (`www/mail/drive/docs/calendar.google.com`), so outbound connection counts aren't concentrated on one SNI.
+- [x] Optional parallel script-ID dispatch (`parallel_relay`): fan out a relay request to N script instances concurrently, return first success, kill p95 latency at the cost of N× quota.
+- [x] Per-site stats drill-down in the UI (requests, cache hit %, bytes, avg latency per host) for live debugging.
+- [x] OpenWRT / Alpine / musl builds — static binaries, procd init script included.
 
 Intentionally **not** implemented (rationale included so future contributors don't spend cycles on them):
 

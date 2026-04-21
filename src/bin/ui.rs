@@ -70,6 +70,7 @@ struct UiState {
     running: bool,
     started_at: Option<Instant>,
     last_stats: Option<mhrv_rs::domain_fronter::StatsSnapshot>,
+    last_per_site: Vec<(String, mhrv_rs::domain_fronter::HostStat)>,
     log: VecDeque<String>,
     ca_trusted: Option<bool>,
     last_test_ok: Option<bool>,
@@ -105,6 +106,7 @@ struct FormState {
     log_level: String,
     verify_ssl: bool,
     upstream_socks5: String,
+    parallel_relay: u8,
     show_auth_key: bool,
 }
 
@@ -139,6 +141,7 @@ fn load_form() -> FormState {
             log_level: c.log_level,
             verify_ssl: c.verify_ssl,
             upstream_socks5: c.upstream_socks5.unwrap_or_default(),
+            parallel_relay: c.parallel_relay,
             show_auth_key: false,
         }
     } else {
@@ -153,6 +156,7 @@ fn load_form() -> FormState {
             log_level: "info".into(),
             verify_ssl: true,
             upstream_socks5: String::new(),
+            parallel_relay: 0,
             show_auth_key: false,
         }
     }
@@ -208,6 +212,7 @@ impl FormState {
                 let v = self.upstream_socks5.trim();
                 if v.is_empty() { None } else { Some(v.to_string()) }
             },
+            parallel_relay: self.parallel_relay,
         })
     }
 }
@@ -241,6 +246,12 @@ struct ConfigWire<'a> {
     hosts: &'a std::collections::HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     upstream_socks5: Option<&'a str>,
+    #[serde(skip_serializing_if = "is_zero_u8")]
+    parallel_relay: u8,
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 #[derive(serde::Serialize)]
@@ -269,6 +280,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             verify_ssl: c.verify_ssl,
             hosts: &c.hosts,
             upstream_socks5: c.upstream_socks5.as_deref(),
+            parallel_relay: c.parallel_relay,
         }
     }
 }
@@ -382,6 +394,20 @@ impl eframe::App for App {
                         .desired_width(f32::INFINITY));
                     ui.end_row();
 
+                    ui.label("Parallel dispatch")
+                        .on_hover_text(
+                            "Fire this many Apps Script IDs in parallel per relay request and\n\
+                             return the first successful response. 0/1 = off (round-robin).\n\
+                             Higher values eliminate long-tail latency (slow script instance\n\
+                             doesn't hold up the fast one) but spend that many times more\n\
+                             daily quota. Only effective with multiple IDs configured.\n\
+                             Recommend 2-3 if you have plenty of quota headroom."
+                        );
+                    ui.add(egui::DragValue::new(&mut self.form.parallel_relay)
+                        .speed(1)
+                        .range(0..=8));
+                    ui.end_row();
+
                     ui.label("Log level");
                     egui::ComboBox::from_id_source("loglevel")
                         .selected_text(&self.form.log_level)
@@ -415,9 +441,16 @@ impl eframe::App for App {
             ui.separator();
 
             // Status + stats
-            let (running, started_at, stats, ca_trusted, last_test_msg) = {
+            let (running, started_at, stats, ca_trusted, last_test_msg, per_site) = {
                 let s = self.shared.state.lock().unwrap();
-                (s.running, s.started_at, s.last_stats, s.ca_trusted, s.last_test_msg.clone())
+                (
+                    s.running,
+                    s.started_at,
+                    s.last_stats,
+                    s.ca_trusted,
+                    s.last_test_msg.clone(),
+                    s.last_per_site.clone(),
+                )
             };
 
             ui.horizontal(|ui| {
@@ -462,6 +495,41 @@ impl eframe::App for App {
                     )).monospace());
                     ui.end_row();
                 });
+            }
+
+            if !per_site.is_empty() {
+                ui.add_space(2.0);
+                egui::CollapsingHeader::new(format!("Per-site ({} hosts)", per_site.len()))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(140.0)
+                            .show(ui, |ui| {
+                                egui::Grid::new("per_site")
+                                    .num_columns(5)
+                                    .spacing([8.0, 2.0])
+                                    .striped(true)
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new("host").strong());
+                                        ui.label(egui::RichText::new("req").strong());
+                                        ui.label(egui::RichText::new("hit%").strong());
+                                        ui.label(egui::RichText::new("bytes").strong());
+                                        ui.label(egui::RichText::new("avg ms").strong());
+                                        ui.end_row();
+                                        for (host, st) in per_site.iter().take(60) {
+                                            let hit_pct = if st.requests > 0 {
+                                                (st.cache_hits as f64 / st.requests as f64) * 100.0
+                                            } else { 0.0 };
+                                            ui.label(egui::RichText::new(host).monospace());
+                                            ui.label(egui::RichText::new(st.requests.to_string()).monospace());
+                                            ui.label(egui::RichText::new(format!("{:.0}%", hit_pct)).monospace());
+                                            ui.label(egui::RichText::new(fmt_bytes(st.bytes)).monospace());
+                                            ui.label(egui::RichText::new(format!("{:.0}", st.avg_latency_ms())).monospace());
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                    });
             }
 
             ui.add_space(4.0);
@@ -573,7 +641,10 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         let f = slot.lock().await;
                         if let Some(fronter) = f.as_ref() {
                             let s = fronter.snapshot_stats();
-                            shared.state.lock().unwrap().last_stats = Some(s);
+                            let per_site = fronter.snapshot_per_site();
+                            let mut st = shared.state.lock().unwrap();
+                            st.last_stats = Some(s);
+                            st.last_per_site = per_site;
                         }
                     });
                 }

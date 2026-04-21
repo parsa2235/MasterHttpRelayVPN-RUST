@@ -1317,13 +1317,14 @@ dependencies = [
 
 [[package]]
 name = "mhrv-rs"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
  "directories",
  "eframe",
  "flate2",
+ "futures-util",
  "h2",
  "http",
  "httparse",

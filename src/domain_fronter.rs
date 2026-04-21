@@ -62,11 +62,21 @@ struct PoolEntry {
 
 pub struct DomainFronter {
     connect_host: String,
-    sni_host: String,
+    /// Pool of SNI domains to rotate through per outbound connection. All of
+    /// them must be hosted on the same Google edge as `connect_host` (that's
+    /// the whole point of domain fronting). Rotating across several of them
+    /// defeats naive DPI that would count "too many connections to a single
+    /// SNI". Populated from config's front_domain: if that's a single name we
+    /// add a small pool of known-safe Google subdomains automatically.
+    sni_hosts: Vec<String>,
+    sni_idx: AtomicUsize,
     http_host: &'static str,
     auth_key: String,
     script_ids: Vec<String>,
     script_idx: AtomicUsize,
+    /// Fan-out factor: fire this many Apps Script instances in parallel
+    /// per request and return first success. `<= 1` = off.
+    parallel_relay: usize,
     tls_connector: TlsConnector,
     pool: Arc<Mutex<Vec<PoolEntry>>>,
     cache: Arc<ResponseCache>,
@@ -76,6 +86,30 @@ pub struct DomainFronter {
     relay_calls: AtomicU64,
     relay_failures: AtomicU64,
     bytes_relayed: AtomicU64,
+    /// Per-host breakdown of traffic going through this fronter. Keyed by
+    /// the host of the URL (e.g. "api.x.com"). Read-mostly; only touched
+    /// on the slow path (once per relayed request), so a plain Mutex is
+    /// fine.
+    per_site: Arc<std::sync::Mutex<HashMap<String, HostStat>>>,
+}
+
+/// Aggregated stats for one remote host.
+#[derive(Default, Clone, Debug)]
+pub struct HostStat {
+    pub requests: u64,
+    pub cache_hits: u64,
+    pub bytes: u64,
+    pub total_latency_ns: u64,
+}
+
+impl HostStat {
+    pub fn avg_latency_ms(&self) -> f64 {
+        if self.requests == 0 {
+            0.0
+        } else {
+            (self.total_latency_ns as f64) / (self.requests as f64) / 1_000_000.0
+        }
+    }
 }
 
 const BLACKLIST_COOLDOWN_SECS: u64 = 600;
@@ -130,9 +164,11 @@ impl DomainFronter {
 
         Ok(Self {
             connect_host: config.google_ip.clone(),
-            sni_host: config.front_domain.clone(),
+            sni_hosts: build_sni_pool(&config.front_domain),
+            sni_idx: AtomicUsize::new(0),
             http_host: "script.google.com",
             auth_key: config.auth_key.clone(),
+            parallel_relay: config.parallel_relay as usize,
             script_ids,
             script_idx: AtomicUsize::new(0),
             tls_connector,
@@ -144,7 +180,34 @@ impl DomainFronter {
             relay_calls: AtomicU64::new(0),
             relay_failures: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
+            per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Increment the per-site counters. Called on every logical request
+    /// (both cache hits and relay roundtrips).
+    fn record_site(&self, url: &str, cache_hit: bool, bytes: u64, latency_ns: u64) {
+        let host = match extract_host(url) {
+            Some(h) => h,
+            None => return,
+        };
+        let mut m = self.per_site.lock().unwrap();
+        let e = m.entry(host).or_default();
+        e.requests += 1;
+        if cache_hit {
+            e.cache_hits += 1;
+        }
+        e.bytes += bytes;
+        e.total_latency_ns += latency_ns;
+    }
+
+    /// Snapshot per-site stats, sorted by request count descending.
+    pub fn snapshot_per_site(&self) -> Vec<(String, HostStat)> {
+        let m = self.per_site.lock().unwrap();
+        let mut v: Vec<(String, HostStat)> =
+            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        v.sort_by(|a, b| b.1.requests.cmp(&a.1.requests));
+        v
     }
 
     pub fn snapshot_stats(&self) -> StatsSnapshot {
@@ -192,6 +255,36 @@ impl DomainFronter {
         self.script_ids[0].clone()
     }
 
+    /// Pick `want` distinct non-blacklisted script IDs for a parallel fan-out
+    /// dispatch. Returns fewer than `want` if there aren't enough non-blacklisted
+    /// IDs available. Advances the round-robin index by `want` to spread load
+    /// across subsequent calls.
+    fn next_script_ids(&self, want: usize) -> Vec<String> {
+        let n = self.script_ids.len();
+        if n == 0 {
+            return vec![];
+        }
+        let mut bl = self.blacklist.lock().unwrap();
+        let now = Instant::now();
+        bl.retain(|_, until| *until > now);
+
+        let mut picked: Vec<String> = Vec::with_capacity(want);
+        for _ in 0..n {
+            if picked.len() >= want {
+                break;
+            }
+            let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
+            let sid = &self.script_ids[idx % n];
+            if !bl.contains_key(sid) && !picked.iter().any(|p| p == sid) {
+                picked.push(sid.clone());
+            }
+        }
+        if picked.is_empty() {
+            picked.push(self.script_ids[0].clone());
+        }
+        picked
+    }
+
     fn blacklist_script(&self, script_id: &str, reason: &str) {
         let until = Instant::now() + Duration::from_secs(BLACKLIST_COOLDOWN_SECS);
         let mut bl = self.blacklist.lock().unwrap();
@@ -204,12 +297,54 @@ impl DomainFronter {
         );
     }
 
+    fn next_sni(&self) -> String {
+        let n = self.sni_hosts.len();
+        let i = self.sni_idx.fetch_add(1, Ordering::Relaxed) % n;
+        self.sni_hosts[i].clone()
+    }
+
     async fn open(&self) -> Result<PooledStream, FronterError> {
         let tcp = TcpStream::connect((self.connect_host.as_str(), 443u16)).await?;
         let _ = tcp.set_nodelay(true);
-        let name = ServerName::try_from(self.sni_host.clone())?;
+        let sni = self.next_sni();
+        let name = ServerName::try_from(sni)?;
         let tls = self.tls_connector.connect(name, tcp).await?;
         Ok(tls)
+    }
+
+    /// Open `n` outbound TLS connections in parallel and park them in the
+    /// pool so the first few user requests don't pay the handshake cost.
+    /// Errors are logged but not returned — best-effort.
+    pub async fn warm(self: &Arc<Self>, n: usize) {
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..n {
+            let me = self.clone();
+            set.spawn(async move {
+                match me.open().await {
+                    Ok(s) => Some(PoolEntry {
+                        stream: s,
+                        created: Instant::now(),
+                    }),
+                    Err(e) => {
+                        tracing::debug!("pool warm: open failed: {}", e);
+                        None
+                    }
+                }
+            });
+        }
+        let mut warmed = 0;
+        while let Some(res) = set.join_next().await {
+            if let Ok(Some(entry)) = res {
+                let mut pool = self.pool.lock().await;
+                if pool.len() < POOL_MAX {
+                    pool.push(entry);
+                    warmed += 1;
+                }
+            }
+        }
+        if warmed > 0 {
+            tracing::info!("pool pre-warmed with {} connection(s)", warmed);
+        }
     }
 
     async fn acquire(&self) -> Result<PoolEntry, FronterError> {
@@ -252,10 +387,12 @@ impl DomainFronter {
     ) -> Vec<u8> {
         let coalescible = is_cacheable_method(method) && body.is_empty();
         let key = if coalescible { Some(cache_key(method, url)) } else { None };
+        let t_start = Instant::now();
 
         if let Some(ref k) = key {
             if let Some(hit) = self.cache.get(k) {
                 tracing::debug!("cache hit: {}", url);
+                self.record_site(url, true, hit.len() as u64, t_start.elapsed().as_nanos() as u64);
                 return hit;
             }
         }
@@ -297,6 +434,7 @@ impl DomainFronter {
             }
         }
 
+        self.record_site(url, false, bytes.len() as u64, t_start.elapsed().as_nanos() as u64);
         bytes
     }
 
@@ -345,13 +483,52 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Vec<u8>, FronterError> {
-        // One retry on connection failure.
+        // Fan-out path: fire N instances in parallel, return first Ok, cancel
+        // the rest. Clamps to number of available script IDs so the single-ID
+        // case is a no-op even if parallel_relay>1 was configured.
+        let fan = self.parallel_relay.min(self.script_ids.len()).max(1);
+        if fan >= 2 {
+            return self.do_relay_parallel(method, url, headers, body, fan).await;
+        }
+
+        // Sequential path: one retry on connection failure.
         match self.do_relay_once(method, url, headers, body).await {
             Ok(v) => Ok(v),
             Err(e) => {
                 tracing::debug!("relay attempt 1 failed: {}; retrying", e);
                 self.do_relay_once(method, url, headers, body).await
             }
+        }
+    }
+
+    async fn do_relay_parallel(
+        self: &Self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        fan: usize,
+    ) -> Result<Vec<u8>, FronterError> {
+        use futures_util::future::FutureExt;
+        let ids = self.next_script_ids(fan);
+        if ids.is_empty() {
+            return Err(FronterError::Relay("no script_ids available".into()));
+        }
+
+        // Build one future per script, each a pinned boxed future so we can
+        // `select_ok` over them.
+        let mut futs = Vec::with_capacity(ids.len());
+        for sid in ids {
+            let fut = self.do_relay_once_with(sid.clone(), method, url, headers, body).boxed();
+            futs.push(fut);
+        }
+
+        // `select_ok`: drive all futures concurrently, return the first Ok
+        // (cancelling the rest when the returned future is dropped). If all
+        // error out, returns the last error.
+        match futures_util::future::select_ok(futs).await {
+            Ok((bytes, _remaining)) => Ok(bytes),
+            Err(e) => Err(e),
         }
     }
 
@@ -362,8 +539,19 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Vec<u8>, FronterError> {
-        let payload = self.build_payload_json(method, url, headers, body)?;
         let script_id = self.next_script_id();
+        self.do_relay_once_with(script_id, method, url, headers, body).await
+    }
+
+    async fn do_relay_once_with(
+        &self,
+        script_id: String,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<Vec<u8>, FronterError> {
+        let payload = self.build_payload_json(method, url, headers, body)?;
         let path = format!("/macros/s/{}/exec", script_id);
 
         let mut entry = self.acquire().await?;
@@ -505,6 +693,59 @@ impl DomainFronter {
 
 /// Strip connection-specific headers (matches Code.gs SKIP_HEADERS) and
 /// strip Accept-Encoding: br (Apps Script can't decompress brotli).
+/// Extract the host (no scheme, no port, no path) from a URL string.
+/// Returns None for malformed / scheme-less inputs.
+fn extract_host(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    // Strip userinfo if present.
+    let authority = authority.rsplit_once('@').map(|(_, a)| a).unwrap_or(authority);
+    // Strip port. Handle IPv6 literals in brackets.
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        // [::1]:443 -> ::1
+        stripped.split_once(']').map(|(h, _)| h).unwrap_or(stripped)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Build the pool of SNI hosts used for outbound connections to the Google
+/// edge. Takes the user-configured `front_domain` as the primary and adds a
+/// few other Google-owned subdomains that share the same GFE, so the per-SNI
+/// connection-count fingerprint gets spread instead of concentrating on one
+/// name. All entries MUST be hosted on the same edge as `connect_host`,
+/// otherwise the TLS handshake will land on the wrong server.
+///
+/// If the user has set `front_domain` to something off the default list, we
+/// still include it first and don't add extras (we'd have no way to verify
+/// they're co-hosted with a non-Google custom edge).
+fn build_sni_pool(primary: &str) -> Vec<String> {
+    let primary = primary.trim().to_string();
+    // A Google-edge-hosted primary: augment with siblings.
+    let google_defaults: &[&str] = &[
+        "www.google.com",
+        "mail.google.com",
+        "drive.google.com",
+        "docs.google.com",
+        "calendar.google.com",
+    ];
+    let looks_like_google_edge = google_defaults.iter().any(|s| *s == primary);
+    let mut pool = vec![primary.clone()];
+    if looks_like_google_edge {
+        for s in google_defaults {
+            if *s != primary {
+                pool.push((*s).to_string());
+            }
+        }
+    }
+    pool
+}
+
 pub fn filter_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     const SKIP: &[&str] = &[
         "host",
@@ -964,6 +1205,30 @@ impl ServerCertVerifier for NoVerify {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_host_strips_scheme_port_path() {
+        assert_eq!(extract_host("https://example.com/foo"), Some("example.com".into()));
+        assert_eq!(extract_host("http://foo.bar:8080/x"), Some("foo.bar".into()));
+        assert_eq!(extract_host("https://user:pw@host.test/x"), Some("host.test".into()));
+        assert_eq!(extract_host("https://[2001:db8::1]:443/"), Some("2001:db8::1".into()));
+        assert_eq!(extract_host("API.X.com/foo"), Some("api.x.com".into()));
+        assert_eq!(extract_host(""), None);
+    }
+
+    #[test]
+    fn build_sni_pool_extends_for_google() {
+        let p = build_sni_pool("www.google.com");
+        assert!(p.len() >= 2);
+        assert_eq!(p[0], "www.google.com");
+        assert!(p.iter().any(|s| s == "mail.google.com"));
+    }
+
+    #[test]
+    fn build_sni_pool_preserves_custom_primary() {
+        let p = build_sni_pool("mycustom.edge.example.com");
+        assert_eq!(p, vec!["mycustom.edge.example.com".to_string()]);
+    }
 
     #[test]
     fn filter_drops_connection_specific() {

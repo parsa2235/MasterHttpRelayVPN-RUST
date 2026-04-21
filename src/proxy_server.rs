@@ -22,12 +22,28 @@ use crate::mitm::MitmCertManager;
 // Kept conservative: anything on a separate CDN (googlevideo, ytimg,
 // doubleclick, etc.) is DROPPED because routing to the wrong backend breaks
 // rather than helps. Those fall through to MITM+relay (slower but works).
+// Domains that are hosted on the Google Front End and therefore reachable via
+// the same SNI-rewrite tunnel used for www.google.com itself. Adding a suffix
+// here means "TLS CONNECT to google_ip, SNI = front_domain, Host = real name"
+// for requests to it — bypassing the Apps Script relay entirely, so there's no
+// User-Agent locking and no Apps Script quota.
+// When in doubt leave it out: sites that aren't actually on GFE will 404 or
+// return a wrong-cert error instead of loading.
 const SNI_REWRITE_SUFFIXES: &[&str] = &[
+    // Core Google
     "google.com",
+    "gstatic.com",
+    "googleusercontent.com",
+    "googleapis.com",
+    "ggpht.com",
+    // YouTube family
     "youtube.com",
     "youtu.be",
     "youtube-nocookie.com",
-    "fonts.googleapis.com",
+    "ytimg.com",
+    // Blogger / Blog.google
+    "blogspot.com",
+    "blogger.com",
 ];
 
 fn matches_sni_rewrite(host: &str) -> bool {
@@ -133,6 +149,14 @@ impl ProxyServer {
             "Listening SOCKS5 on {} — xray / Telegram / app-level SOCKS5 clients use this.",
             socks_addr
         );
+
+        // Pre-warm the outbound connection pool so the user's first request
+        // doesn't pay a fresh TLS handshake to Google edge. Best-effort;
+        // failures are logged and ignored.
+        let warm_fronter = self.fronter.clone();
+        tokio::spawn(async move {
+            warm_fronter.warm(3).await;
+        });
 
         let stats_fronter = self.fronter.clone();
         tokio::spawn(async move {
@@ -709,7 +733,10 @@ async fn do_sni_rewrite_tunnel_from_tcp(
     )
     .await
     {
-        Ok(Ok(s)) => s,
+        Ok(Ok(s)) => {
+            let _ = s.set_nodelay(true);
+            s
+        }
         Ok(Err(e)) => {
             tracing::debug!("upstream connect failed for {}: {}", host, e);
             return Ok(());

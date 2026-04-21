@@ -62,6 +62,16 @@ pub struct Config {
     /// unaffected.
     #[serde(default)]
     pub upstream_socks5: Option<String>,
+    /// Fan-out factor for non-cached relay requests when multiple
+    /// `script_id`s are configured. `0` or `1` = off (round-robin, the
+    /// default). `2` or more = fire that many Apps Script instances in
+    /// parallel per request and return the first successful response —
+    /// kills long-tail latency caused by a single slow Apps Script
+    /// instance, at the cost of using that much more daily quota.
+    /// Value is clamped to the number of available (non-blacklisted)
+    /// script IDs.
+    #[serde(default)]
+    pub parallel_relay: u8,
 }
 
 fn default_google_ip() -> String {

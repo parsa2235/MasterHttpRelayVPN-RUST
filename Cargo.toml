@@ -1,6 +1,6 @@
 [package]
 name = "mhrv-rs"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "Rust port of MasterHttpRelayVPN -- DPI bypass via Google Apps Script relay with domain fronting"
 license = "MIT"
@@ -44,6 +44,7 @@ h2 = "0.4"
 http = "1"
 flate2 = "1"
 directories = "5"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # Optional UI dep: only pulled in when --features ui is set.
 eframe = { version = "0.28", default-features = false, features = [
