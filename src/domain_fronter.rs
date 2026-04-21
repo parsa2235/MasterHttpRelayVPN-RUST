@@ -318,12 +318,15 @@ impl DomainFronter {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
                 self.relay_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::error!("Relay failed: {}", e);
+                // Most upstream errors (self-signed certs, unreachable hosts,
+                // non-HTTP endpoints) are normal for misrouted traffic. Log
+                // at warn so they don't spam error channels.
+                tracing::warn!("relay failed: {}", e);
                 return error_response(502, &format!("Relay error: {}", e));
             }
             Err(_) => {
                 self.relay_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::error!("Relay timeout");
+                tracing::warn!("relay timeout");
                 return error_response(504, "Relay timeout");
             }
         };
