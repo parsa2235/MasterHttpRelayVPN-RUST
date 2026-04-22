@@ -46,6 +46,7 @@ const CANDIDATE_IPS: &[&str] = &[
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const CONCURRENCY: usize = 8;
+const GOOG_JSON_URL: &str = "https://www.gstatic.com/ipranges/goog.json";
 
 struct Result_ {
     ip: String,
@@ -53,9 +54,22 @@ struct Result_ {
     error: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct GoogJson {
+    prefixes: Vec<Prefix>,
+}
+
+#[derive(serde::Deserialize)]
+struct Prefix {
+    #[serde(rename = "ipv4Prefix")]
+    ipv4_prefix: Option<String>,
+}
+
 pub async fn run(config: &Config) -> bool {
+    let ips = fetch_google_ips().await;
+    
     let sni = config.front_domain.clone();
-    println!("Scanning {} Google frontend IPs (SNI={}, timeout={}s)...", CANDIDATE_IPS.len(), sni, PROBE_TIMEOUT.as_secs());
+    println!("Scanning {} Google frontend IPs (SNI={}, timeout={}s)...", ips.len(), sni, PROBE_TIMEOUT.as_secs());
     println!();
 
     let tls_cfg = ClientConfig::builder()
@@ -65,8 +79,8 @@ pub async fn run(config: &Config) -> bool {
     let connector = TlsConnector::from(Arc::new(tls_cfg));
 
     let sem = Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
-    let mut tasks = Vec::with_capacity(CANDIDATE_IPS.len());
-    for ip in CANDIDATE_IPS {
+    let mut tasks = Vec::with_capacity(ips.len());
+    for ip in &ips {
         let sni = sni.clone();
         let connector = connector.clone();
         let sem = sem.clone();
@@ -113,6 +127,31 @@ pub async fn run(config: &Config) -> bool {
         println!("To use the fastest, set \"google_ip\" in config.json to the top result above.");
         true
     }
+}
+
+async fn fetch_google_ips() -> Vec<String> {
+    match reqwest::get(GOOG_JSON_URL).await {
+        Ok(resp) => {
+            if let Ok(data) = resp.json::<GoogJson>().await {
+                let mut ips = Vec::new();
+                for prefix in data.prefixes {
+                    if let Some(ipv4) = prefix.ipv4_prefix {
+                        if let Some(ip) = ipv4.split('/').next() {
+                            ips.push(ip.to_string());
+                        }
+                    }
+                }
+                if !ips.is_empty() {
+                    println!("Fetched {} IPv4 addresses from goog.json", ips.len());
+                    return ips;
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    
+    println!("Failed to fetch goog.json, using static IP list");
+    CANDIDATE_IPS.iter().map(|s| s.to_string()).collect()
 }
 
 async fn probe(ip: &str, sni: &str, connector: TlsConnector) -> Result_ {
