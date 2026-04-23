@@ -1235,12 +1235,35 @@ fn build_sni_pool(primary: &str) -> Vec<String> {
 
 pub fn filter_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     const SKIP: &[&str] = &[
+        // Hop-by-hop / framing — must not be forwarded across the proxy.
         "host",
         "connection",
         "content-length",
         "transfer-encoding",
         "proxy-connection",
         "proxy-authorization",
+        // Identity-revealing forwarding headers (issue #104).
+        // If the user sits behind another proxy or uses a browser
+        // extension that inserts any of these, they'd normally carry
+        // the client's real IP. We strip every known variant so the
+        // origin server only ever sees whatever source IP the Apps
+        // Script or GFE path terminates on — never the user's home IP.
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-forwarded-server",
+        "x-forwarded-ssl",
+        "forwarded",
+        "via",
+        "x-real-ip",
+        "x-client-ip",
+        "x-originating-ip",
+        "true-client-ip",
+        "cf-connecting-ip",
+        "fastly-client-ip",
+        "x-cluster-client-ip",
+        "client-ip",
     ];
     headers
         .iter()
@@ -1721,6 +1744,59 @@ impl ServerCertVerifier for NoVerify {
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncWriteExt};
+
+    #[test]
+    fn filter_forwarded_headers_strips_identity_revealing_headers() {
+        // Issue #104: any proxy/extension that inserts these must not
+        // leak the client's real IP to origin via the Apps Script relay.
+        let input: Vec<(String, String)> = vec![
+            ("X-Forwarded-For".into(), "203.0.113.42".into()),
+            ("X-Real-IP".into(), "203.0.113.42".into()),
+            ("Forwarded".into(), "for=203.0.113.42".into()),
+            ("Via".into(), "1.1 squid".into()),
+            ("CF-Connecting-IP".into(), "203.0.113.42".into()),
+            ("True-Client-IP".into(), "203.0.113.42".into()),
+            ("X-Client-IP".into(), "203.0.113.42".into()),
+            ("Fastly-Client-IP".into(), "203.0.113.42".into()),
+            ("X-Cluster-Client-IP".into(), "203.0.113.42".into()),
+            ("Client-IP".into(), "203.0.113.42".into()),
+            ("X-Originating-IP".into(), "203.0.113.42".into()),
+            ("X-Forwarded-Host".into(), "internal.example".into()),
+            ("X-Forwarded-Proto".into(), "https".into()),
+            ("X-Forwarded-Port".into(), "8080".into()),
+            ("X-Forwarded-Server".into(), "lb-01.example".into()),
+            ("X-Forwarded-Ssl".into(), "on".into()),
+            // Mix in a legitimate header that MUST pass through.
+            ("User-Agent".into(), "Mozilla/5.0".into()),
+            ("Accept".into(), "text/html".into()),
+        ];
+        let out = filter_forwarded_headers(&input);
+        let keys: Vec<String> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+        // All identity-revealing headers must be dropped.
+        for h in [
+            "x-forwarded-for",
+            "x-real-ip",
+            "forwarded",
+            "via",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-client-ip",
+            "fastly-client-ip",
+            "x-cluster-client-ip",
+            "client-ip",
+            "x-originating-ip",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-server",
+            "x-forwarded-ssl",
+        ] {
+            assert!(!keys.iter().any(|k| k == h), "{} must be stripped", h);
+        }
+        // And legitimate headers must survive.
+        assert!(keys.iter().any(|k| k == "user-agent"));
+        assert!(keys.iter().any(|k| k == "accept"));
+    }
 
     #[test]
     fn normalize_x_graphql_trims_after_variables() {
