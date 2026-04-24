@@ -129,6 +129,7 @@ pub struct Config {
     /// features. Turn on and observe.
     #[serde(default)]
     pub normalize_x_graphql: bool,
+
     /// Route YouTube traffic through the Apps Script relay instead of
     /// the direct SNI-rewrite tunnel. Ported from upstream Python
     /// `youtube_via_relay` (issue #102).

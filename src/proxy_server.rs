@@ -31,23 +31,14 @@ use crate::tunnel_client::TunnelMux;
 // User-Agent locking and no Apps Script quota.
 // When in doubt leave it out: sites that aren't actually on GFE will 404 or
 // return a wrong-cert error instead of loading.
-const SNI_REWRITE_CORE_SUFFIXES: &[&str] = &[
+const SNI_REWRITE_SUFFIXES: &[&str] = &[
+    // Core Google
     "google.com",
     "gstatic.com",
     "googleusercontent.com",
     "googleapis.com",
-    "doubleclick.net",
-    "googlesyndication.com",
-    "googleadservices.com",
-    "google-analytics.com",
-    "googletagmanager.com",
-    "googletagservices.com",
     "ggpht.com",
-    "blogspot.com",
-    "blogger.com",
-];
-
-const SNI_REWRITE_YOUTUBE_SUFFIXES: &[&str] = &[
+    // YouTube family
     "youtube.com",
     "youtu.be",
     "youtube-nocookie.com",
@@ -59,6 +50,15 @@ const SNI_REWRITE_YOUTUBE_SUFFIXES: &[&str] = &[
     // traverse Apps Script instead of the direct GFE tunnel.
     "gvt1.com",
     "gvt2.com",
+    // Ad + analytics infra. All on GFE, all previously broken the
+    // same way YouTube was: SNI-blocked on Iranian DPI, but reachable
+    // via `google_ip` with SNI rewritten.
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googletagservices.com",
     // fonts.googleapis.com is technically covered by the googleapis.com
     // suffix above, but mirroring Python's explicit listing makes the
     // intent obvious at a glance.
@@ -80,9 +80,8 @@ const YOUTUBE_SNI_SUFFIXES: &[&str] = &[
 fn matches_sni_rewrite(host: &str, youtube_via_relay: bool) -> bool {
     let h = host.to_ascii_lowercase();
     let h = h.trim_end_matches('.');
-    SNI_REWRITE_CORE_SUFFIXES
+    SNI_REWRITE_SUFFIXES
         .iter()
-        .chain(SNI_REWRITE_YOUTUBE_SUFFIXES.iter())
         .filter(|s| {
             // If the user opted into youtube_via_relay, skip YouTube
             // suffixes so they fall through to the Apps Script relay
