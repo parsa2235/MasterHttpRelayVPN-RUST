@@ -83,8 +83,22 @@ class MhrvVpnService : VpnService() {
         Native.setDataDir(filesDir.absolutePath)
 
         val cfg = ConfigStore.load(this)
-        if (!cfg.hasDeploymentId || cfg.authKey.isBlank()) {
-            Log.e(TAG, "Config is incomplete — can't start proxy")
+
+        // Android 8+ requires every service started via
+        // `startForegroundService()` to call `startForeground()` within a
+        // short window or the system crashes the app with
+        // `ForegroundServiceDidNotStartInTimeException`. Every `stopSelf()`
+        // path below MUST therefore happen after a `startForeground()`
+        // call — otherwise the user-visible symptom is "the app crashes
+        // the instant I tap Start". See issue #73.
+        startForeground(NOTIF_ID, buildNotif(cfg.listenPort))
+
+        // Deployment ID + auth key are only required in apps_script mode.
+        // google_only (bootstrap) and full (tunnel) modes run without them.
+        val needsAppsScriptCreds = cfg.mode == Mode.APPS_SCRIPT
+        if (needsAppsScriptCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
+            Log.e(TAG, "Config is incomplete — can't start proxy in apps_script mode")
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
             stopSelf()
             return
         }
@@ -104,6 +118,7 @@ class MhrvVpnService : VpnService() {
         proxyHandle = Native.startProxy(cfg.toJson())
         if (proxyHandle == 0L) {
             Log.e(TAG, "Native.startProxy returned 0 — see logcat tag mhrv_rs")
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
             stopSelf()
             return
         }
@@ -115,12 +130,11 @@ class MhrvVpnService : VpnService() {
         // another VPN app already owns the system VPN slot, the user
         // wants per-app opt-in via Wi-Fi proxy settings, or the device
         // is a sandboxed/rooted setup where VpnService is unwelcome.
-        // We still run as a foreground service (required for the native
-        // listener thread to survive backgrounding), we just skip every
-        // VPN-specific step below. Issue #37.
+        // We already called startForeground() at the top of this method,
+        // which is all PROXY_ONLY needs for the listener thread to survive
+        // backgrounding. Issue #37.
         if (cfg.connectionMode == ConnectionMode.PROXY_ONLY) {
             Log.i(TAG, "PROXY_ONLY mode: listeners up, skipping VpnService/TUN")
-            startForeground(NOTIF_ID, buildNotif(cfg.listenPort))
             VpnState.setRunning(true)
             return
         }
@@ -202,6 +216,7 @@ class MhrvVpnService : VpnService() {
             Log.e(TAG, "establish() returned null — is VPN permission granted?")
             Native.stopProxy(proxyHandle)
             proxyHandle = 0L
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
             stopSelf()
             return
         }
@@ -232,7 +247,10 @@ class MhrvVpnService : VpnService() {
             }
         }, "tun2proxy").apply { start() }
 
-        startForeground(NOTIF_ID, buildNotif(cfg.listenPort))
+        // (startForeground was already called at the top of this method
+        // to satisfy Android 8+'s foreground-service contract — see the
+        // comment at the start of startEverything. Calling it here again
+        // would be a no-op but wasteful.)
 
         // Publish "running" state for the UI's Connect/Disconnect button
         // to observe. Only flipped true once everything above succeeded —
