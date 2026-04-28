@@ -268,9 +268,11 @@ impl Config {
             ));
         }
         if self.socks5_port == Some(self.listen_port) {
-            return Err(ConfigError::Invalid(
-                "listen_port and socks5_port must be different".into(),
-            ));
+            return Err(ConfigError::Invalid(format!(
+                "listen_port and socks5_port must differ on the same host \
+                 (both set to {} on {}). Change one of them in config.json.",
+                self.listen_port, self.listen_host
+            )));
         }
         Ok(())
     }

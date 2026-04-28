@@ -61,6 +61,11 @@ const POOL_TTL_SECS: u64 = 45;
 const POOL_MAX: usize = 80;
 const REQUEST_TIMEOUT_SECS: u64 = 25;
 const RANGE_PARALLEL_CHUNK_BYTES: u64 = 256 * 1024;
+/// Cadence for Apps Script container keepalive pings. Apps Script
+/// containers go cold after ~5min idle and cost 1-3s on the first
+/// request to wake back up — most painful on YouTube / streaming where
+/// the first chunk after a quiet pause stalls the player.
+const H1_KEEPALIVE_INTERVAL_SECS: u64 = 240;
 // Keep synthetic range stitching bounded. Without this, a buggy or hostile
 // origin can advertise `Content-Range: bytes 0-1/<huge>` and make us build a
 // massive range plan or preallocate an enormous response buffer.
@@ -592,6 +597,45 @@ impl DomainFronter {
         }
         if warmed > 0 {
             tracing::info!("pool pre-warmed with {} connection(s)", warmed);
+        }
+    }
+
+    /// Keep the Apps Script container warm with a periodic HEAD ping.
+    ///
+    /// `acquire()` keeps the *TCP/TLS pool* warm but does nothing for the
+    /// V8 container Apps Script runs in: that goes cold ~5min after the
+    /// last UrlFetchApp call and costs 1-3s to spin back up. The symptom
+    /// is "first request after a quiet period stalls" — most visible on
+    /// YouTube where the player gives up on a 1.5s `googlevideo.com`
+    /// chunk that's actually waiting on a cold-start.
+    ///
+    /// Bypasses the response cache (`cache_key_opt = None`) and the
+    /// inflight coalescer — otherwise the second iteration would just
+    /// hit the cached response from the first and never reach Apps
+    /// Script. The relay payload itself is the cheapest non-error one
+    /// we can build: a HEAD against `http://example.com/` returns a few
+    /// hundred bytes, no body decode, no auth.
+    ///
+    /// Best-effort. Failures are debug-logged so a flaky network or
+    /// quota-exhausted account doesn't spam warnings every 4 minutes.
+    /// Loops forever — caller is expected to drop the JoinHandle on
+    /// shutdown (the task lives as long as the process).
+    pub async fn run_h1_keepalive(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(H1_KEEPALIVE_INTERVAL_SECS)).await;
+            let t0 = Instant::now();
+            // relay_uncoalesced returns Vec<u8> (always — errors are
+            // baked into 5xx responses), so just observe the duration
+            // for the debug line. We intentionally don't use relay()
+            // here because that path goes through the cache + coalesce
+            // layer, which would short-circuit subsequent pings.
+            let _ = self
+                .relay_uncoalesced("HEAD", "http://example.com/", &[], &[], None)
+                .await;
+            tracing::debug!(
+                "H1 container keepalive: {}ms",
+                t0.elapsed().as_millis()
+            );
         }
     }
 

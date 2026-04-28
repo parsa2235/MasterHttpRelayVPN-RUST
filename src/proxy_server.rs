@@ -327,6 +327,28 @@ impl ProxyServer {
             });
         }
 
+        // Apps Script container keepalive. `warm()` above keeps the TCP
+        // pool warm at startup, but the V8 container behind UrlFetchApp
+        // goes cold after ~5min idle and costs 1-3s to wake. A periodic
+        // HEAD ping prevents the cold-start lag on the first request
+        // after a quiet pause (most visible as YouTube player stalls).
+        // Skipped in google_only mode for the same reason as warm —
+        // there's no fronter to ping.
+        //
+        // The handle is captured (not fire-and-forget) so the shutdown
+        // arm of the select! below can abort it. Without that, hitting
+        // Stop in the UI would leave the keepalive holding an
+        // Arc<DomainFronter> on stale config and pinging Apps Script
+        // every 240s — same class of bug that issue #99 hit for the
+        // accept loops.
+        let keepalive_task = if let Some(keepalive_fronter) = self.fronter.clone() {
+            tokio::spawn(async move {
+                keepalive_fronter.run_h1_keepalive().await;
+            })
+        } else {
+            tokio::spawn(async move { std::future::pending::<()>().await })
+        };
+
         let stats_task = if let Some(stats_fronter) = self.fronter.clone() {
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -434,6 +456,7 @@ impl ProxyServer {
             _ = &mut shutdown_rx => {
                 tracing::info!("Shutdown signal received, stopping listeners");
                 stats_task.abort();
+                keepalive_task.abort();
                 http_task.abort();
                 socks_task.abort();
             }
@@ -507,8 +530,26 @@ async fn handle_http_client(
     tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
     let (head, leftover) = match read_http_head(&mut sock).await? {
-        Some(v) => v,
-        None => return Ok(()),
+        HeadReadResult::Got { head, leftover } => (head, leftover),
+        HeadReadResult::Closed => return Ok(()),
+        HeadReadResult::Oversized => {
+            // Reply with 431 instead of just dropping the socket so the
+            // browser shows a real error rather than retrying the same
+            // oversized request in a loop.
+            tracing::warn!(
+                "request head exceeds {} bytes — refusing with 431",
+                MAX_HEADER_BYTES
+            );
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\n\
+                      Connection: close\r\n\
+                      Content-Length: 0\r\n\r\n",
+                )
+                .await;
+            let _ = sock.flush().await;
+            return Ok(());
+        }
     };
 
     let (method, target, _version, _headers) = parse_request_head(&head)
@@ -1608,14 +1649,35 @@ fn looks_like_http(first_bytes: &[u8]) -> bool {
 /// Read an HTTP head (request line + headers) up to the first \r\n\r\n.
 /// Returns (head_bytes, leftover_after_head). The leftover may contain part
 /// of the request body already received.
-async fn read_http_head(sock: &mut TcpStream) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+/// Maximum size of an HTTP request head (request line + all headers).
+///
+/// Set to match upstream Python's `MAX_HEADER_BYTES` (64 KB,
+/// masterking32/MasterHttpRelayVPN constants.py). Real browsers
+/// virtually never exceed ~16 KB; anything past 64 KB is either a
+/// buggy client or a deliberate slowloris-style header bomb.
+/// Previously 1 MB, which let a misbehaving client allocate a lot
+/// of memory before failing.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Result of `read_http_head` / `read_http_head_io`.
+/// `Oversized` is distinct from other I/O errors so the caller can
+/// reply with `431 Request Header Fields Too Large` instead of just
+/// dropping the connection (which a browser would silently retry,
+/// reproducing the same problem).
+enum HeadReadResult {
+    Got { head: Vec<u8>, leftover: Vec<u8> },
+    Closed,
+    Oversized,
+}
+
+async fn read_http_head(sock: &mut TcpStream) -> std::io::Result<HeadReadResult> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     loop {
         let n = sock.read(&mut tmp).await?;
         if n == 0 {
             return if buf.is_empty() {
-                Ok(None)
+                Ok(HeadReadResult::Closed)
             } else {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -1627,13 +1689,10 @@ async fn read_http_head(sock: &mut TcpStream) -> std::io::Result<Option<(Vec<u8>
         if let Some(pos) = find_headers_end(&buf) {
             let head = buf[..pos].to_vec();
             let leftover = buf[pos..].to_vec();
-            return Ok(Some((head, leftover)));
+            return Ok(HeadReadResult::Got { head, leftover });
         }
-        if buf.len() > 1024 * 1024 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "headers too large",
-            ));
+        if buf.len() > MAX_HEADER_BYTES {
+            return Ok(HeadReadResult::Oversized);
         }
     }
 }
@@ -1942,8 +2001,31 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (head, leftover) = match read_http_head_io(stream).await? {
-        Some(v) => v,
-        None => return Ok(false),
+        HeadReadResult::Got { head, leftover } => (head, leftover),
+        HeadReadResult::Closed => return Ok(false),
+        HeadReadResult::Oversized => {
+            // Inside MITM: same reasoning as the plaintext path. Return
+            // 431 over the decrypted stream so the browser surfaces a
+            // real error to the user instead of looping a connection
+            // reset, which was the symptom upstream caught (Apps Script
+            // ate malformed JSON when truncated header blocks were
+            // forwarded blindly).
+            tracing::warn!(
+                "MITM header block exceeds {} bytes — closing ({}:{})",
+                MAX_HEADER_BYTES,
+                host,
+                port
+            );
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\n\
+                      Connection: close\r\n\
+                      Content-Length: 0\r\n\r\n",
+                )
+                .await;
+            let _ = stream.flush().await;
+            return Ok(false);
+        }
     };
 
     let (method, path, _version, headers) = match parse_request_head(&head) {
@@ -2064,7 +2146,7 @@ where
     Ok(!connection_close)
 }
 
-async fn read_http_head_io<S>(stream: &mut S) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>>
+async fn read_http_head_io<S>(stream: &mut S) -> std::io::Result<HeadReadResult>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -2074,7 +2156,7 @@ where
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
             return if buf.is_empty() {
-                Ok(None)
+                Ok(HeadReadResult::Closed)
             } else {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -2086,13 +2168,10 @@ where
         if let Some(pos) = find_headers_end(&buf) {
             let head = buf[..pos].to_vec();
             let leftover = buf[pos..].to_vec();
-            return Ok(Some((head, leftover)));
+            return Ok(HeadReadResult::Got { head, leftover });
         }
-        if buf.len() > 1024 * 1024 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "headers too large",
-            ));
+        if buf.len() > MAX_HEADER_BYTES {
+            return Ok(HeadReadResult::Oversized);
         }
     }
 }
