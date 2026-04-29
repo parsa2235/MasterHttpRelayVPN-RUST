@@ -76,7 +76,7 @@ enum class Mode { APPS_SCRIPT, GOOGLE_ONLY, FULL }
 data class MhrvConfig(
     val mode: Mode = Mode.APPS_SCRIPT,
 
-    val listenHost: String = "127.0.0.1",
+    val listenHost: String = "0.0.0.0",
     val listenPort: Int = 8080,
     val socks5Port: Int? = 1081,
 
@@ -395,7 +395,7 @@ object ConfigStore {
                 "full" -> Mode.FULL
                 else -> Mode.APPS_SCRIPT
             },
-            listenHost = obj.optString("listen_host", "127.0.0.1"),
+            listenHost = obj.optString("listen_host", "0.0.0.0"),
             listenPort = obj.optInt("listen_port", 8080),
             socks5Port = obj.optInt("socks5_port", 1081).takeIf { it > 0 },
             appsScriptUrls = urls,

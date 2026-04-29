@@ -319,6 +319,26 @@ More deployments = more total concurrency = lower per-session latency. Each batc
 }
 ```
 
+## Sharing via hotspot (Android → iOS / laptop)
+
+The proxy listens on `0.0.0.0` by default, so any device on the same network can use it. This lets you share the tunnel from an Android phone to an iPhone, iPad, or laptop over hotspot:
+
+1. **Android**: enable mobile hotspot + start the app
+2. **Other device**: connect to the Android hotspot WiFi
+3. **Configure proxy** on the other device:
+   - **Server**: `192.168.43.1` (Android's default hotspot IP)
+   - **Port**: `8080` (HTTP) or `1081` (SOCKS5)
+
+### iOS setup
+Settings → WiFi → tap (i) on the hotspot network → Configure Proxy → Manual → Server `192.168.43.1`, Port `8080`.
+
+For full device-wide coverage on iOS, use an app like [Shadowrocket](https://apps.apple.com/app/shadowrocket/id932747118) or [Potatso](https://apps.apple.com/app/potatso/id1239860606) — point it at the SOCKS5 proxy (`192.168.43.1:1081`) and it will route all traffic through the tunnel.
+
+### macOS / Windows
+Set the system HTTP proxy to `192.168.43.1:8080` in network settings, or configure per-app SOCKS5 proxy to `192.168.43.1:1081`.
+
+> **Note**: if `listen_host` is set to `127.0.0.1` in your config, change it to `0.0.0.0` to allow connections from other devices.
+
 ## Running on OpenWRT (or any musl distro)
 
 The `*-linux-musl-*` archives ship a fully static CLI that runs on OpenWRT, Alpine, and any libc-less Linux userland. Put the binary on the router and start it as a service:

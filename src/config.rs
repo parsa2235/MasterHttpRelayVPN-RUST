@@ -266,7 +266,7 @@ fn default_front_domain() -> String {
     "www.google.com".into()
 }
 fn default_listen_host() -> String {
-    "127.0.0.1".into()
+    "0.0.0.0".into()
 }
 fn default_listen_port() -> u16 {
     8085
