@@ -82,9 +82,17 @@ jobs:
           # Mirror the retry pattern from `release.yml`'s download step —
           # GitHub's release-asset CDN occasionally times out on cold
           # tags. Three attempts with 30 s backoff covers most flakes.
+          #
+          # `--clobber` overwrites any partial files left behind by a
+          # previous failed attempt — without it, attempt 2/3 would error
+          # with "already exists" the moment any single asset finished
+          # downloading on attempt 1 before the CDN timed out (the v1.9.2
+          # publish hit exactly this — HTTP 500 mid-download, then attempts
+          # 2/3 failed on "already exists" for the assets that did finish).
           for attempt in 1 2 3; do
             if gh release download "v${{ steps.ver.outputs.version }}" \
                  --dir assets \
+                 --clobber \
                  --repo "${GITHUB_REPOSITORY}"; then
               echo "downloaded release assets on attempt $attempt"
               ls -la assets/
