@@ -12,7 +12,7 @@
 🇬🇧 [English Quick Start](#quick-start) · [Full Guide (advanced topics)](docs/guide.md)
 🇮🇷 [راه‌اندازی سریع فارسی](#راه‌اندازی-سریع) · [راهنمای کامل (مباحث پیشرفته)](docs/guide.fa.md)
 
-<p align="center"><b>راهنمای راه اندازی به فارسی:</b></p>
+<p align="center"><b>راهنمای تصویری راه اندازی به زبان فارسی</b></p>
 <p align="center">
   <a href="https://www.youtube.com/watch?v=voCwxgvWR5U" target="_blank" rel="noopener noreferrer">
     <img src="https://img.youtube.com/vi/voCwxgvWR5U/maxresdefault.jpg" alt="راهنمای راه اندازی mhrv-rs به فارسی" width="560">
