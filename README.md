@@ -14,7 +14,7 @@
 
 <p align="center"><b>راهنمای راه اندازی به فارسی:</b></p>
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=voCwxgvWR5U">
+  <a href="https://www.youtube.com/watch?v=voCwxgvWR5U" target="_blank" rel="noopener noreferrer">
     <img src="https://img.youtube.com/vi/voCwxgvWR5U/maxresdefault.jpg" alt="راهنمای راه اندازی mhrv-rs به فارسی" width="560">
   </a>
 </p>
